@@ -1,0 +1,247 @@
+from flask import Flask, render_template, request, redirect, url_for, session, flash, g
+import sqlite3
+import re
+from datetime import datetime
+from werkzeug.security import generate_password_hash, check_password_hash
+from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
+import os
+
+# -------------------------
+# App setup & configuration
+# -------------------------
+app = Flask(__name__)
+# Change this in production: use a long random value, e.g. from os.urandom(24).hex()
+app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY", "dev-secret-change-me")
+app.config["DATABASE"] = os.environ.get(
+    "DATABASE", os.path.join(app.root_path, "app.db")
+)
+app.config["SECURITY_PASSWORD_SALT"] = os.environ.get(
+    "SECURITY_PASSWORD_SALT", "dev-salt-change-me"
+)
+
+# Serializer for password reset tokens
+serializer = URLSafeTimedSerializer(app.config["SECRET_KEY"])
+
+
+# -------------------------
+# Database helpers
+# -------------------------
+def get_db():
+    if "db" not in g:
+        g.db = sqlite3.connect(app.config["DATABASE"])
+        g.db.row_factory = sqlite3.Row
+    return g.db
+
+
+@app.teardown_appcontext
+def close_db(error=None):
+    db = g.pop("db", None)
+    if db is not None:
+        db.close()
+
+
+def init_db():
+    db = get_db()
+    db.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            email TEXT UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        """
+    )
+    db.commit()
+
+
+@app.before_request
+def before_request():
+    init_db()
+
+
+# -------------------------
+# Small helpers
+# -------------------------
+EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+
+def validate_email(email: str) -> bool:
+    return bool(EMAIL_RE.match(email or ""))
+
+
+def logged_in() -> bool:
+    return bool(session.get("user_id"))
+
+
+def get_current_user():
+    if not logged_in():
+        return None
+    db = get_db()
+    return db.execute(
+        "SELECT id, email, created_at FROM users WHERE id = ?", (session["user_id"],)
+    ).fetchone()
+
+
+# -------------------------
+# Routes
+# -------------------------
+@app.route("/")
+def index():
+    user = get_current_user()
+    return render_template("index.html", user=user)
+
+
+@app.route("/register", methods=["GET", "POST"])
+def register():
+    if request.method == "POST":
+        email = request.form.get("email", "").strip().lower()
+        password = request.form.get("password", "")
+        password2 = request.form.get("password2", "")
+
+        # Basic validation
+        errors = []
+        if not validate_email(email):
+            errors.append("Please enter a valid email address.")
+        if len(password) < 8:
+            errors.append("Password must be at least 8 characters long.")
+        if password != password2:
+            errors.append("Passwords do not match.")
+
+        if not errors:
+            db = get_db()
+            # Check if email exists
+            exists = db.execute(
+                "SELECT 1 FROM users WHERE email = ?", (email,)
+            ).fetchone()
+            if exists:
+                errors.append("An account with that email already exists.")
+            else:
+                password_hash = generate_password_hash(password)
+                db.execute(
+                    "INSERT INTO users (email, password_hash, created_at) VALUES (?, ?, ?)",
+                    (
+                        email,
+                        password_hash,
+                        datetime.utcnow().isoformat(timespec="seconds"),
+                    ),
+                )
+                db.commit()
+                flash("Registration successful. You can now log in.", "success")
+                return redirect(url_for("login"))
+
+        for e in errors:
+            flash(e, "error")
+
+    return render_template("register.html")
+
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    if request.method == "POST":
+        email = request.form.get("email", "").strip().lower()
+        password = request.form.get("password", "")
+
+        db = get_db()
+        user = db.execute(
+            "SELECT id, email, password_hash FROM users WHERE email = ?", (email,)
+        ).fetchone()
+
+        if user and check_password_hash(user["password_hash"], password):
+            session["user_id"] = user["id"]
+            flash("Welcome back!", "success")
+            return redirect(url_for("index"))
+        else:
+            flash("Invalid email or password.", "error")
+
+    return render_template("login.html")
+
+
+@app.route("/logout")
+def logout():
+    session.clear()
+    flash("You have been logged out.", "success")
+    return redirect(url_for("index"))
+
+
+@app.route("/forgot", methods=["GET", "POST"])
+def forgot():
+    if request.method == "POST":
+        email = request.form.get("email", "").strip().lower()
+        if not validate_email(email):
+            flash("Please enter a valid email address.", "error")
+            return render_template("forgot.html")
+
+        db = get_db()
+        user = db.execute("SELECT id FROM users WHERE email = ?", (email,)).fetchone()
+        if not user:
+            # Don't reveal whether the email exists to avoid user enumeration
+            flash("If the email exists, a reset link has been sent.", "info")
+            return redirect(url_for("login"))
+
+        # Generate a token that encodes the user's email
+        token = serializer.dumps(email, salt=app.config["SECURITY_PASSWORD_SALT"])
+
+        # In a real app, you'd email this link. For this project, we will print it to the console.
+        reset_url = url_for("reset_password", token=token, _external=True)
+        print(f"[DEV] Password reset link for {email}: {reset_url}")
+
+        flash(
+            "If the email exists, a reset link has been sent. (Check the server console in this demo.)",
+            "info",
+        )
+        return redirect(url_for("login"))
+
+    return render_template("forgot.html")
+
+
+@app.route("/reset/<token>", methods=["GET", "POST"])
+def reset_password(token):
+    try:
+        email = serializer.loads(
+            token, salt=app.config["SECURITY_PASSWORD_SALT"], max_age=3600
+        )  # 1 hour
+    except SignatureExpired:
+        flash("Reset link expired. Please request a new one.", "error")
+        return redirect(url_for("forgot"))
+    except BadSignature:
+        flash("Invalid reset link.", "error")
+        return redirect(url_for("forgot"))
+
+    if request.method == "POST":
+        password = request.form.get("password", "")
+        password2 = request.form.get("password2", "")
+        errors = []
+        if len(password) < 8:
+            errors.append("Password must be at least 8 characters long.")
+        if password != password2:
+            errors.append("Passwords do not match.")
+        if errors:
+            for e in errors:
+                flash(e, "error")
+        else:
+            db = get_db()
+            password_hash = generate_password_hash(password)
+            db.execute(
+                "UPDATE users SET password_hash = ? WHERE email = ?",
+                (password_hash, email),
+            )
+            db.commit()
+            flash("Password has been reset. Please log in.", "success")
+            return redirect(url_for("login"))
+
+    return render_template("reset.html", email=email)
+
+
+
+
+# -------------------------
+# Run the app
+# -------------------------
+if __name__ == "__main__":
+    # Host 0.0.0.0 for container support; use debug for dev
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=True)
+
+
+
+
